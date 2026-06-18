@@ -1,0 +1,8 @@
+services:
+  discord-recorder:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./recordings:/recordings
+    restart: unless-stopped
