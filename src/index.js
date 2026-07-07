@@ -24,7 +24,7 @@ if (!token) {
 }
 
 const recordingsDir = process.env.RECORDINGS_DIR || path.join(process.cwd(), "recordings");
-const maxUploadBytes = Number(process.env.MAX_UPLOAD_MB || 24) * 1024 * 1024;
+const maxUploadBytes = Number(process.env.MAX_UPLOAD_MB || 8) * 1024 * 1024;
 const sessions = new Map();
 
 fs.mkdirSync(recordingsDir, { recursive: true });
@@ -260,10 +260,23 @@ async function handleStop(interaction) {
       lines.push("The mixed audio is too large to attach to Discord.");
     }
 
-    await interaction.editReply({
-      content: lines.join("\n"),
-      files
-    });
+    try {
+      await interaction.editReply({
+        content: lines.join("\n"),
+        files
+      });
+    } catch (error) {
+      if (files.length > 0 && /request entity too large/i.test(error.message || "")) {
+        lines.push("The mixed audio is too large to attach to Discord.");
+        await interaction.editReply({
+          content: lines.join("\n"),
+          files: []
+        });
+        return;
+      }
+
+      throw error;
+    }
   } catch (error) {
     await interaction.editReply(`Failed while stopping the recording: ${error.message}`);
   }

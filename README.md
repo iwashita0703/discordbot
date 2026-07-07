@@ -22,7 +22,7 @@ DISCORD_CLIENT_ID=your_application_id
 DISCORD_GUILD_ID=your_server_id
 
 RECORDINGS_DIR=/recordings
-MAX_UPLOAD_MB=24
+MAX_UPLOAD_MB=8
 ```
 
 スラッシュコマンドを登録します。
