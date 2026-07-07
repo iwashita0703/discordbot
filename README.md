@@ -1,6 +1,6 @@
 # Discord Voice Recorder Bot
 
-Docker で動く Discord ボイスチャンネル録音 bot です。`/record` で bot が通話に入り、`/stop` で録音を停止して `recordings/` に `mixed.ogg` を保存します。`OPENAI_API_KEY` を設定すると、Discord ユーザーごとに話者分離した `transcript.txt` も自動生成します。
+Docker で動く Discord ボイスチャンネル録音 bot です。`/record` で bot が通話に入り、`/stop` で録音を停止して `recordings/` に `mixed.ogg` を保存します。
 
 録音は必ず参加者全員の同意を取ってから使ってください。サーバールールや地域の法律によっては禁止・制限される場合があります。
 
@@ -21,9 +21,8 @@ DISCORD_TOKEN=your_bot_token
 DISCORD_CLIENT_ID=your_application_id
 DISCORD_GUILD_ID=your_server_id
 
-OPENAI_API_KEY=your_openai_api_key
-TRANSCRIPTION_MODEL=gpt-4o-mini-transcribe
-TRANSCRIPTION_LANGUAGE=ja
+RECORDINGS_DIR=/recordings
+MAX_UPLOAD_MB=24
 ```
 
 スラッシュコマンドを登録します。
@@ -56,6 +55,5 @@ docker compose down
 2. テキストチャンネルで `/record` を実行します。
 3. 録音を止めたいときに `/stop` を実行します。
 4. 録音結果は `recordings/<guild>-<timestamp>/mixed.ogg` に保存されます。
-5. `OPENAI_API_KEY` が設定されていれば `transcript.txt` と `transcript.json` も保存されます。
 
-短い録音は Discord にも添付されます。大きい録音は `recordings/` にだけ保存されます。文字起こしは発話ごとに行い、行頭に時刻、Discord 表示名、ユーザー ID を付けます。
+短い録音は Discord にも添付されます。大きい録音は `recordings/` にだけ保存されます。

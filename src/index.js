@@ -17,9 +17,6 @@ const {
   joinVoiceChannel
 } = require("@discordjs/voice");
 const prism = require("prism-media");
-const OpenAIImport = require("openai");
-
-const OpenAI = OpenAIImport.OpenAI || OpenAIImport.default || OpenAIImport;
 
 const token = process.env.DISCORD_TOKEN;
 if (!token) {
@@ -28,11 +25,6 @@ if (!token) {
 
 const recordingsDir = process.env.RECORDINGS_DIR || path.join(process.cwd(), "recordings");
 const maxUploadBytes = Number(process.env.MAX_UPLOAD_MB || 24) * 1024 * 1024;
-const transcriptionModel = process.env.TRANSCRIPTION_MODEL || "gpt-4o-mini-transcribe";
-const transcriptionLanguage = process.env.TRANSCRIPTION_LANGUAGE || "ja";
-const openai = process.env.OPENAI_API_KEY
-  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-  : null;
 const sessions = new Map();
 
 fs.mkdirSync(recordingsDir, { recursive: true });
@@ -160,23 +152,10 @@ class RecordingSession {
       await mixSegments(this.sessionDir, this.segments, mixedPath);
     }
 
-    let transcript = null;
-    if (this.segments.length > 0) {
-      transcript = await transcribeSegments({
-        guild: this.guild,
-        sessionDir: this.sessionDir,
-        sessionInfo: manifest,
-        segments: this.segments
-      });
-    }
-
     return {
       sessionDir: this.sessionDir,
       manifestPath,
       mixedPath: fs.existsSync(mixedPath) ? mixedPath : null,
-      transcriptPath: transcript?.textPath || null,
-      transcriptJsonPath: transcript?.jsonPath || null,
-      transcriptionSkipped: transcript?.skippedReason || null,
       segmentCount: this.segments.length
     };
   }
@@ -184,9 +163,6 @@ class RecordingSession {
 
 client.once("ready", () => {
   console.log(`Logged in as ${client.user.tag}.`);
-  if (!openai) {
-    console.log("OPENAI_API_KEY is not set. Recording works, transcription will be skipped.");
-  }
 });
 
 client.on("interactionCreate", async (interaction) => {
@@ -269,12 +245,6 @@ async function handleStop(interaction) {
       `Saved to: ${result.sessionDir}`
     ];
 
-    if (result.transcriptPath) {
-      lines.push(`Transcript: ${result.transcriptPath}`);
-    } else if (result.transcriptionSkipped) {
-      lines.push(`Transcript skipped: ${result.transcriptionSkipped}`);
-    }
-
     if (!result.mixedPath) {
       await interaction.editReply(`${lines.join("\n")}\nNo audio was recorded.`);
       return;
@@ -288,12 +258,6 @@ async function handleStop(interaction) {
       }));
     } else {
       lines.push("The mixed audio is too large to attach to Discord.");
-    }
-
-    if (result.transcriptPath && fs.statSync(result.transcriptPath).size <= maxUploadBytes) {
-      files.push(new AttachmentBuilder(result.transcriptPath, {
-        name: path.basename(result.transcriptPath)
-      }));
     }
 
     await interaction.editReply({
@@ -358,197 +322,8 @@ async function mixSegments(sessionDir, segments, outputPath) {
   ]);
 }
 
-async function transcribeSegments({ guild, sessionDir, sessionInfo, segments }) {
-  const transcriptDir = path.join(sessionDir, "transcription");
-  const textPath = path.join(sessionDir, "transcript.txt");
-  const jsonPath = path.join(sessionDir, "transcript.json");
-
-  if (!openai) {
-    return { skippedReason: "OPENAI_API_KEY is not set" };
-  }
-
-  fs.mkdirSync(transcriptDir, { recursive: true });
-
-  const speakerNames = await getSpeakerNames(guild, segments);
-  const entries = [];
-  let transcriptError = null;
-
-  for (const segment of segments) {
-    const segmentPath = path.join(sessionDir, segment.file);
-    if (!isUsableAudioSegment(segmentPath)) {
-      continue;
-    }
-
-    const audioPath = path.join(
-      transcriptDir,
-      `${String(segment.index).padStart(4, "0")}-${segment.userId}.ogg`
-    );
-
-    try {
-      await convertPcmToOgg(segmentPath, audioPath);
-      const text = await transcribeAudioFile(audioPath);
-      const cleaned = text.trim();
-      if (!cleaned) continue;
-
-      entries.push({
-        index: segment.index,
-        startOffsetMs: segment.startOffsetMs,
-        timestamp: formatTimestamp(segment.startOffsetMs),
-        userId: segment.userId,
-        speaker: speakerNames.get(segment.userId) || segment.userId,
-        text: cleaned,
-        audioFile: path.relative(sessionDir, audioPath).replace(/\\/g, "/")
-      });
-      console.log(`Transcribed segment ${segment.index}.`);
-    } catch (error) {
-      const normalizedError = normalizeTranscriptionError(error);
-      entries.push({
-        index: segment.index,
-        startOffsetMs: segment.startOffsetMs,
-        timestamp: formatTimestamp(segment.startOffsetMs),
-        userId: segment.userId,
-        speaker: speakerNames.get(segment.userId) || segment.userId,
-        error: normalizedError
-      });
-      console.error(`Failed to transcribe segment ${segment.index}:`, error);
-
-      if (isQuotaError(error)) {
-        transcriptError = normalizedError;
-        break;
-      }
-    }
-  }
-
-  const transcript = {
-    model: transcriptionModel,
-    language: transcriptionLanguage,
-    speakerSeparation: "Discord voice receiver user IDs",
-    session: sessionInfo,
-    error: transcriptError,
-    entries
-  };
-
-  fs.writeFileSync(jsonPath, JSON.stringify(transcript, null, 2));
-  writeUtf8BomFile(textPath, renderTranscriptText(transcript));
-
-  return { textPath, jsonPath, entries };
-}
-
-async function transcribeAudioFile(audioPath) {
-  const request = {
-    file: fs.createReadStream(audioPath),
-    model: transcriptionModel
-  };
-
-  if (transcriptionLanguage) {
-    request.language = transcriptionLanguage;
-  }
-
-  const result = await openai.audio.transcriptions.create(request);
-  if (typeof result === "string") return result;
-  return result.text || "";
-}
-
-async function convertPcmToOgg(inputPath, outputPath) {
-  await runCommand("ffmpeg", [
-    "-hide_banner",
-    "-loglevel",
-    "error",
-    "-y",
-    "-f",
-    "s16le",
-    "-ar",
-    "48000",
-    "-ac",
-    "2",
-    "-i",
-    inputPath,
-    "-c:a",
-    "libopus",
-    "-b:a",
-    "48k",
-    outputPath
-  ]);
-}
-
-async function getSpeakerNames(guild, segments) {
-  const names = new Map();
-  const userIds = [...new Set(segments.map((segment) => segment.userId))];
-
-  for (const userId of userIds) {
-    try {
-      const member = await guild.members.fetch(userId);
-      names.set(userId, member.displayName || member.user.username || userId);
-    } catch {
-      names.set(userId, userId);
-    }
-  }
-
-  return names;
-}
-
-function renderTranscriptText(transcript) {
-  const lines = [
-    "Discord Voice Recorder Transcript",
-    `Started: ${transcript.session.startedAt}`,
-    `Stopped: ${transcript.session.stoppedAt}`,
-    `Channel: ${transcript.session.voiceChannelName} (${transcript.session.voiceChannelId})`,
-    `Model: ${transcript.model}`,
-    `Speaker separation: ${transcript.speakerSeparation}`,
-    ""
-  ];
-
-  if (transcript.entries.length === 0) {
-    lines.push("No speech was transcribed.");
-  }
-
-  if (transcript.error) {
-    lines.push(`Transcription stopped: ${transcript.error}`);
-    lines.push("");
-  }
-
-  for (const entry of transcript.entries) {
-    if (entry.error) {
-      lines.push(`[${entry.timestamp}] ${entry.speaker} (${entry.userId}): [transcription failed: ${entry.error}]`);
-      continue;
-    }
-
-    lines.push(`[${entry.timestamp}] ${entry.speaker} (${entry.userId}): ${entry.text}`);
-  }
-
-  lines.push("");
-  return lines.join("\n");
-}
-
-function normalizeTranscriptionError(error) {
-  const message = error?.message || String(error);
-  if (isQuotaError(error)) {
-    return "OpenAI API quota exceeded. Check billing/credits for the API key.";
-  }
-  return message;
-}
-
-function isQuotaError(error) {
-  return error?.status === 429 || /exceeded your current quota/i.test(error?.message || "");
-}
-
-function writeUtf8BomFile(filePath, text) {
-  fs.writeFileSync(filePath, `\uFEFF${text}`, "utf8");
-}
-
 function isUsableAudioSegment(segmentPath) {
   return fs.existsSync(segmentPath) && fs.statSync(segmentPath).size > 3840;
-}
-
-function formatTimestamp(ms) {
-  const totalSeconds = Math.floor(ms / 1000);
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-
-  return [hours, minutes, seconds]
-    .map((value) => String(value).padStart(2, "0"))
-    .join(":");
 }
 
 function runCommand(command, args) {
