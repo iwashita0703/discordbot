@@ -5,7 +5,6 @@ const path = require("path");
 const { pipeline } = require("stream");
 const { spawn } = require("child_process");
 const {
-  AttachmentBuilder,
   Client,
   GatewayIntentBits,
   Partials
@@ -24,7 +23,6 @@ if (!token) {
 }
 
 const recordingsDir = process.env.RECORDINGS_DIR || path.join(process.cwd(), "recordings");
-const maxUploadBytes = Number(process.env.MAX_UPLOAD_MB || 8) * 1024 * 1024;
 const sessions = new Map();
 
 fs.mkdirSync(recordingsDir, { recursive: true });
@@ -250,33 +248,12 @@ async function handleStop(interaction) {
       return;
     }
 
-    const files = [];
     const mixedStats = fs.statSync(result.mixedPath);
-    if (mixedStats.size <= maxUploadBytes) {
-      files.push(new AttachmentBuilder(result.mixedPath, {
-        name: path.basename(result.mixedPath)
-      }));
-    } else {
-      lines.push("The mixed audio is too large to attach to Discord.");
-    }
+    lines.push(`File: ${result.mixedPath}`);
+    lines.push(`Size: ${formatBytes(mixedStats.size)}`);
+    lines.push("Saved locally only. No file was attached to Discord.");
 
-    try {
-      await interaction.editReply({
-        content: lines.join("\n"),
-        files
-      });
-    } catch (error) {
-      if (files.length > 0 && /request entity too large/i.test(error.message || "")) {
-        lines.push("The mixed audio is too large to attach to Discord.");
-        await interaction.editReply({
-          content: lines.join("\n"),
-          files: []
-        });
-        return;
-      }
-
-      throw error;
-    }
+    await interaction.editReply(lines.join("\n"));
   } catch (error) {
     await interaction.editReply(`Failed while stopping the recording: ${error.message}`);
   }
@@ -337,6 +314,13 @@ async function mixSegments(sessionDir, segments, outputPath) {
 
 function isUsableAudioSegment(segmentPath) {
   return fs.existsSync(segmentPath) && fs.statSync(segmentPath).size > 3840;
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
 function runCommand(command, args) {
