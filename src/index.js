@@ -24,6 +24,12 @@ if (!token) {
 
 const recordingsDir = process.env.RECORDINGS_DIR || path.join(process.cwd(), "recordings");
 const sessions = new Map();
+const PCM_SAMPLE_RATE = 48000;
+const PCM_CHANNELS = 2;
+const PCM_BYTES_PER_SAMPLE = 2;
+const PCM_FRAME_BYTES = PCM_CHANNELS * PCM_BYTES_PER_SAMPLE;
+const PCM_BYTES_PER_SECOND = PCM_SAMPLE_RATE * PCM_FRAME_BYTES;
+const MIX_CHUNK_BYTES = PCM_BYTES_PER_SECOND;
 
 fs.mkdirSync(recordingsDir, { recursive: true });
 
@@ -269,51 +275,157 @@ async function waitForPipelines(activePipelines, timeoutMs) {
 }
 
 async function mixSegments(sessionDir, segments, outputPath) {
-  const inputs = [];
-  const filters = [];
-  const labels = [];
+  const preparedSegments = segments
+    .map((segment) => {
+      const segmentPath = path.join(sessionDir, segment.file);
+      if (!isUsableAudioSegment(segmentPath)) {
+        return null;
+      }
 
-  segments.forEach((segment) => {
-    const segmentPath = path.join(sessionDir, segment.file);
-    if (!isUsableAudioSegment(segmentPath)) {
-      return;
-    }
+      const segmentSize = alignToFrame(fs.statSync(segmentPath).size);
+      const offsetBytes = startOffsetToBytes(segment.startOffsetMs);
+      return {
+        path: segmentPath,
+        offsetBytes,
+        size: segmentSize,
+        endBytes: offsetBytes + segmentSize,
+        fd: null
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.offsetBytes - b.offsetBytes);
 
-    inputs.push("-f", "s16le", "-ar", "48000", "-ac", "2", "-i", segmentPath);
-    const inputIndex = labels.length;
-    const label = `a${labels.length}`;
-    const delay = Math.max(0, Math.floor(segment.startOffsetMs));
-    filters.push(`[${inputIndex}:a]adelay=${delay}|${delay}[${label}]`);
-    labels.push(`[${label}]`);
-  });
+  if (preparedSegments.length === 0) return;
 
-  if (labels.length === 0) return;
+  const totalBytes = Math.max(...preparedSegments.map((segment) => segment.endBytes));
+  const mixedPcmPath = path.join(sessionDir, "mixed.pcm");
 
-  const filterComplex =
-    labels.length === 1
-      ? `${filters.join(";")};${labels[0]}alimiter=limit=0.95[out]`
-      : `${filters.join(";")};${labels.join("")}amix=inputs=${labels.length}:duration=longest:normalize=0,alimiter=limit=0.95[out]`;
+  try {
+    await writeMixedPcm(preparedSegments, totalBytes, mixedPcmPath);
 
-  await runCommand("ffmpeg", [
-    "-hide_banner",
-    "-loglevel",
-    "error",
-    "-y",
-    ...inputs,
-    "-filter_complex",
-    filterComplex,
-    "-map",
-    "[out]",
-    "-c:a",
-    "libopus",
-    "-b:a",
-    "96k",
-    outputPath
-  ]);
+    await runCommand("ffmpeg", [
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-y",
+      "-f",
+      "s16le",
+      "-ar",
+      String(PCM_SAMPLE_RATE),
+      "-ac",
+      String(PCM_CHANNELS),
+      "-i",
+      mixedPcmPath,
+      "-c:a",
+      "libopus",
+      "-b:a",
+      "96k",
+      outputPath
+    ]);
+  } finally {
+    fs.rmSync(mixedPcmPath, { force: true });
+  }
 }
 
 function isUsableAudioSegment(segmentPath) {
   return fs.existsSync(segmentPath) && fs.statSync(segmentPath).size > 3840;
+}
+
+async function writeMixedPcm(segments, totalBytes, mixedPcmPath) {
+  let outputFd = null;
+  let activeSegments = [];
+  let nextSegmentIndex = 0;
+
+  try {
+    outputFd = fs.openSync(mixedPcmPath, "w");
+
+    for (let chunkStart = 0; chunkStart < totalBytes; chunkStart += MIX_CHUNK_BYTES) {
+      const chunkBytes = alignToFrame(Math.min(MIX_CHUNK_BYTES, totalBytes - chunkStart));
+      const chunkEnd = chunkStart + chunkBytes;
+
+      while (
+        nextSegmentIndex < segments.length &&
+        segments[nextSegmentIndex].offsetBytes < chunkEnd
+      ) {
+        const segment = segments[nextSegmentIndex];
+        segment.fd = fs.openSync(segment.path, "r");
+        activeSegments.push(segment);
+        nextSegmentIndex += 1;
+      }
+
+      activeSegments = activeSegments.filter((segment) => {
+        if (segment.endBytes <= chunkStart) {
+          closeSegmentFd(segment);
+          return false;
+        }
+        return true;
+      });
+
+      const mixedSamples = new Int32Array(chunkBytes / PCM_BYTES_PER_SAMPLE);
+
+      for (const segment of activeSegments) {
+        const overlapStart = Math.max(chunkStart, segment.offsetBytes);
+        const overlapEnd = Math.min(chunkEnd, segment.endBytes);
+        const readBytes = alignToFrame(overlapEnd - overlapStart);
+        if (readBytes <= 0) continue;
+
+        const readBuffer = Buffer.allocUnsafe(readBytes);
+        const bytesRead = fs.readSync(
+          segment.fd,
+          readBuffer,
+          0,
+          readBytes,
+          overlapStart - segment.offsetBytes
+        );
+        const targetSampleStart = (overlapStart - chunkStart) / PCM_BYTES_PER_SAMPLE;
+
+        for (let byteIndex = 0; byteIndex + 1 < bytesRead; byteIndex += PCM_BYTES_PER_SAMPLE) {
+          mixedSamples[targetSampleStart + byteIndex / PCM_BYTES_PER_SAMPLE] +=
+            readBuffer.readInt16LE(byteIndex);
+        }
+      }
+
+      const outputBuffer = Buffer.allocUnsafe(chunkBytes);
+      let peak = 0;
+      for (const sample of mixedSamples) {
+        const absoluteSample = Math.abs(sample);
+        if (absoluteSample > peak) peak = absoluteSample;
+      }
+
+      const scale = peak > 32767 ? 32767 / peak : 1;
+      for (let sampleIndex = 0; sampleIndex < mixedSamples.length; sampleIndex += 1) {
+        outputBuffer.writeInt16LE(
+          clipInt16(Math.round(mixedSamples[sampleIndex] * scale)),
+          sampleIndex * PCM_BYTES_PER_SAMPLE
+        );
+      }
+
+      fs.writeSync(outputFd, outputBuffer, 0, outputBuffer.length);
+    }
+  } finally {
+    if (outputFd !== null) fs.closeSync(outputFd);
+    activeSegments.forEach(closeSegmentFd);
+  }
+}
+
+function startOffsetToBytes(startOffsetMs) {
+  const offsetMs = Number.isFinite(startOffsetMs) ? startOffsetMs : 0;
+  const offsetBytes = Math.floor((Math.max(0, offsetMs) / 1000) * PCM_BYTES_PER_SECOND);
+  return alignToFrame(offsetBytes);
+}
+
+function alignToFrame(bytes) {
+  return Math.max(0, bytes - (bytes % PCM_FRAME_BYTES));
+}
+
+function closeSegmentFd(segment) {
+  if (segment.fd === null) return;
+  fs.closeSync(segment.fd);
+  segment.fd = null;
+}
+
+function clipInt16(value) {
+  return Math.max(-32768, Math.min(32767, value));
 }
 
 function formatBytes(bytes) {
